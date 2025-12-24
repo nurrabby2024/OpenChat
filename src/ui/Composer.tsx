@@ -23,8 +23,8 @@ export function Composer(props: {
   const over = charCount > maxChars;
 
   useEffect(() => {
-    if (!cooldown) return;
-    const t = window.setInterval(() => setCooldown((c) => Math.max(0, c - 0.02)), 50);
+    if (cooldown <= 0) return;
+    const t = window.setInterval(() => setCooldown((c) => Math.max(0, c - 0.04)), 80);
     return () => window.clearInterval(t);
   }, [cooldown]);
 
@@ -49,6 +49,11 @@ export function Composer(props: {
   };
 
   const doSend = async () => {
+    if (props.disabled) {
+      toast.push({ title: "Loading…", detail: "Contract is still loading. Try again in a second.", kind: "warn" });
+      return;
+    }
+
     if (!preflight()) {
       if (!props.connected) props.onConnect();
       return;
@@ -61,15 +66,19 @@ export function Composer(props: {
     setSending(true);
     setHelper("Waiting for approval…");
     try {
-      const r = await props.onSend(msg);
-      if (r.ok) {
+      const res = await props.onSend(msg);
+      if (res.ok) {
         setText("");
         setCooldown(1);
         setHelper("Approve tx to publish onchain");
-      } else if (r.cancelled) {
-        setHelper("Approve tx to publish onchain");
+        // keep typing smooth
+        window.setTimeout(() => inputRef.current?.focus(), 30);
       } else {
-        setHelper(r.error ? `Failed — ${r.error}` : "Failed — retry");
+        if (res.cancelled) {
+          setHelper("Approve tx to publish onchain");
+          return;
+        }
+        setHelper(res.error || "Failed — retry");
       }
     } finally {
       setSending(false);
@@ -84,13 +93,12 @@ export function Composer(props: {
     }
   };
 
-  const disabled = props.disabled || sending || !props.connected;
-
   return (
-    <div className="px-4 pb-5">
-      <div className="rounded-2xl border border-line bg-panel backdrop-blur px-4 py-3 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
+    <div className="px-3 pb-4">
+      <div className="rounded-2xl border border-line bg-panel backdrop-blur px-3 py-2 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
         <div className="flex items-end gap-3">
-          <div className="text-accent font-mono text-lg leading-none pb-2 select-none">&gt;</div>
+          <div className="text-accent font-mono text-base leading-none pb-1 select-none">&gt;</div>
+
           <div className="flex-1">
             <textarea
               ref={inputRef}
@@ -100,39 +108,50 @@ export function Composer(props: {
               disabled={!props.connected || sending}
               rows={1}
               className={[
-                "w-full resize-none bg-transparent outline-none font-mono text-sm text-text placeholder:text-muted",
-                "leading-6 max-h-32",
+                "w-full resize-none bg-transparent outline-none font-mono text-[13px] text-text placeholder:text-muted",
+                "leading-5 max-h-32",
                 !props.connected ? "opacity-60" : "",
               ].join(" ")}
               placeholder={props.connected ? "type a message…" : "Connect wallet to speak"}
             />
-            <div className="mt-2 flex items-center justify-between gap-3">
-              <div className="text-xs font-mono text-muted">
-                {helper}
-              </div>
+
+            <div className="mt-1.5 flex items-center justify-between gap-3">
+              <div className="text-[11px] font-mono text-muted truncate">{helper}</div>
+
               <button
                 onClick={props.connected ? doSend : props.onConnect}
-                disabled={props.disabled || sending}
+                disabled={sending}
                 className={[
-                  "h-10 w-10 rounded-xl border grid place-items-center transition",
-                  props.connected ? "border-[rgba(125,255,207,0.30)] bg-[rgba(125,255,207,0.08)] text-text hover:shadow-glow"
-                                 : "border-line bg-[rgba(255,255,255,0.02)] text-muted hover:shadow-glow",
-                  (props.disabled || sending) ? "opacity-60 pointer-events-none" : ""
+                  "h-9 w-9 rounded-xl border grid place-items-center transition",
+                  props.connected
+                    ? "border-[rgba(125,255,207,0.30)] bg-[rgba(125,255,207,0.08)] text-text hover:shadow-glow"
+                    : "border-line bg-[rgba(255,255,255,0.02)] text-muted hover:shadow-glow",
+                  sending ? "opacity-60 pointer-events-none" : "",
                 ].join(" ")}
                 aria-label={props.connected ? "Send message" : "Connect wallet"}
                 title={props.connected ? "Send" : "Connect wallet"}
               >
-                {sending ? <span className="h-3 w-3 rounded-full border border-line border-t-accent animate-spin" /> : <SendIcon />}
+                {sending ? (
+                  <span className="h-3 w-3 rounded-full border border-line border-t-accent animate-spin" />
+                ) : (
+                  <SendIcon />
+                )}
               </button>
             </div>
 
-            <div className="mt-2 flex items-center justify-between text-xs font-mono text-muted">
+            <div className="mt-1.5 flex items-center justify-between text-xs font-mono text-muted">
               <div className="flex items-center gap-3">
-                <span className={over ? "text-err" : ""}>{charCount}/{maxChars}</span>
+                <span className={over ? "text-err" : ""}>
+                  {charCount}/{maxChars}
+                </span>
               </div>
+
               <div className="flex items-center gap-2">
                 <div className="h-1.5 w-24 rounded-full bg-[rgba(255,255,255,0.06)] overflow-hidden">
-                  <div className="h-full bg-[rgba(125,255,207,0.35)]" style={{ width: `${Math.round((1 - clamp(cooldown,0,1)) * 100)}%` }} />
+                  <div
+                    className="h-full bg-[rgba(125,255,207,0.35)]"
+                    style={{ width: `${Math.round((1 - clamp(cooldown, 0, 1)) * 100)}%` }}
+                  />
                 </div>
                 <span className="opacity-70">cooldown</span>
               </div>
@@ -142,7 +161,7 @@ export function Composer(props: {
               <div className="mt-3">
                 <button
                   onClick={props.onConnect}
-                  className="w-full rounded-2xl border border-[rgba(125,255,207,0.25)] bg-[rgba(125,255,207,0.06)] px-4 py-3 text-sm font-mono text-text hover:shadow-glow transition"
+                  className="w-full rounded-2xl border border-[rgba(125,255,207,0.25)] bg-[rgba(125,255,207,0.08)] px-4 py-3 text-sm font-mono text-text hover:shadow-glow transition"
                 >
                   Connect wallet
                 </button>
@@ -158,7 +177,12 @@ export function Composer(props: {
 function SendIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="opacity-90">
-      <path d="M3 11.5 21 3l-8.5 18-2.5-7-7-2.5Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
+      <path
+        d="M3 11.5 21 3l-8.5 18-2.5-7-7-2.5Z"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinejoin="round"
+      />
       <path d="M10 14 21 3" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
     </svg>
   );
