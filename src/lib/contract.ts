@@ -15,20 +15,53 @@ export type ContractShape = {
 const ABI_PROXY_URL = "/api/abi";
 
 export async function fetchAbi(): Promise<any[]> {
-  const res = await fetch(ABI_PROXY_URL, { headers: { "accept": "application/json" }, cache: "no-store" });
-  const json: any = await res.json().catch(() => null);
-  const raw = json?.result;
-  if (!raw || typeof raw !== "string") throw new Error("ABI unavailable");
-  const abi = JSON.parse(raw);
-  if (!Array.isArray(abi)) throw new Error("Invalid ABI format");
-  return abi;
+  // A few quiet retries (helps slow serverless cold start)
+  const maxTries = 6;
+  let lastErr: any = null;
+
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      const res = await fetch(ABI_PROXY_URL, {
+        headers: { accept: "application/json" },
+        cache: "no-store",
+      });
+
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+
+      // If rewrites are wrong, /api/abi returns HTML (index.html)
+      if (!ct.includes("application/json")) {
+        const txt = await res.text().catch(() => "");
+        const hint =
+          txt.includes("<!doctype html") || txt.includes("<html")
+            ? "ABI endpoint returned HTML. Fix vercel.json rewrites: /api/* must NOT rewrite to /index.html."
+            : "ABI endpoint did not return JSON.";
+        throw new Error(hint);
+      }
+
+      const json: any = await res.json().catch(() => null);
+      const raw = json?.result;
+
+      if (!raw || typeof raw !== "string") {
+        throw new Error("ABI unavailable (missing result)");
+      }
+
+      const abi = JSON.parse(raw);
+      if (!Array.isArray(abi)) throw new Error("Invalid ABI format");
+      return abi;
+    } catch (e: any) {
+      lastErr = e;
+      // Backoff: 150ms, 300ms, 600ms...
+      const wait = Math.min(1200, 150 * Math.pow(2, i));
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
+  throw lastErr || new Error("ABI unavailable");
 }
-
-
 
 function scoreSendFn(name: string) {
   const n = (name || "").toLowerCase();
-  const hits = ["message","chat","post","write","send","say","speak","bitchat","publish","shout"];
+  const hits = ["message", "chat", "post", "write", "send", "say", "speak", "bitchat", "publish", "shout"];
   let s = 0;
   for (const h of hits) if (n.includes(h)) s += 5;
   return s;
@@ -36,14 +69,17 @@ function scoreSendFn(name: string) {
 
 function scoreEvent(name: string) {
   const n = (name || "").toLowerCase();
-  const hits = ["message","chat","post","write","send","say","speak","bitchat","publish"];
+  const hits = ["message", "chat", "post", "write", "send", "say", "speak", "bitchat", "publish"];
   let s = 0;
   for (const h of hits) if (n.includes(h)) s += 4;
   return s;
 }
 
 export function inferContractShape(abi: any[]): ContractShape {
-  const fns = abi.filter((x) => x?.type === "function" && x?.stateMutability !== "view" && x?.stateMutability !== "pure");
+  const fns = abi.filter(
+    (x) => x?.type === "function" && x?.stateMutability !== "view" && x?.stateMutability !== "pure"
+  );
+
   const stringFns = fns
     .map((f: any) => ({ f, inputs: (f?.inputs ?? []) as any[] }))
     .filter(({ inputs }) => inputs.length === 1 && (inputs[0]?.type === "string" || inputs[0]?.type === "bytes"));
@@ -57,9 +93,11 @@ export function inferContractShape(abi: any[]): ContractShape {
 
   const events = abi.filter((x) => x?.type === "event");
   const msgEvents = events.filter((e: any) => (e?.inputs ?? []).some((i: any) => i?.type === "string" || i?.type === "bytes"));
+
   if (msgEvents.length === 0) {
     throw new Error("No suitable message event found (expected event with string/bytes)");
   }
+
   msgEvents.sort((a: any, b: any) => scoreEvent(b.name) - scoreEvent(a.name));
   const eventName = msgEvents[0].name;
 
@@ -84,9 +122,13 @@ export async function encodeSendData(shape: ContractShape, message: string): Pro
   });
 }
 
-export async function decodeLogs(shape: ContractShape, logs: any[]): Promise<Array<{ from: string; text: string; txHash: string; logIndex: number }>> {
+export async function decodeLogs(
+  shape: ContractShape,
+  logs: any[]
+): Promise<Array<{ from: string; text: string; txHash: string; logIndex: number }>> {
   const viem = await import("https://esm.sh/viem");
   const { decodeEventLog } = viem as any;
+
   const out: Array<{ from: string; text: string; txHash: string; logIndex: number }> = [];
 
   for (const l of logs) {
@@ -96,31 +138,53 @@ export async function decodeLogs(shape: ContractShape, logs: any[]): Promise<Arr
         data: l.data,
         topics: l.topics,
       });
+
       if (decoded?.eventName !== shape.eventName) continue;
+
       const args = decoded.args ?? {};
-      // Try common keys
       const from = (args.from || args.sender || args.author || args.user || args._from || args[0] || "").toString();
       const text = (args.message || args.text || args.content || args.body || args._message || args[1] || "").toString();
+
       if (!from || !text) continue;
-      out.push({ from, text, txHash: l.transactionHash, logIndex: parseInt(l.logIndex, 16) });
+
+      const txHash = (l.transactionHash || "").toString();
+      const li = l.logIndex;
+      const logIndex =
+        typeof li === "number"
+          ? li
+          : typeof li === "string" && li.startsWith("0x")
+          ? parseInt(li, 16)
+          : parseInt(String(li || "0"), 10);
+
+      out.push({ from, text, txHash, logIndex: Number.isFinite(logIndex) ? logIndex : 0 });
     } catch {
       // ignore non-matching logs
     }
   }
+
   return out;
 }
 
-export async function walletSendCalls(provider: Eip1193Provider, from: string, chainId: string, to: string, data: string, dataSuffix: string) {
+export async function walletSendCalls(
+  provider: Eip1193Provider,
+  from: string,
+  chainId: string,
+  to: string,
+  data: string,
+  dataSuffix: string
+) {
   const payload = {
     version: "2.0.0",
     from,
     chainId,
     atomicRequired: true,
-    calls: [{
-      to,
-      value: "0x0",
-      data,
-    }],
+    calls: [
+      {
+        to,
+        value: "0x0",
+        data,
+      },
+    ],
     capabilities: { dataSuffix },
   };
 
