@@ -1,45 +1,18 @@
-const RPCS = ["/api/rpc"];
+import { rpcCall } from "./contract";
 
-export type RpcHealth = { status: "green" | "yellow" | "red"; rpc: string; blockNumber?: number; ms?: number; note?: string };
-
-async function rpcCall(rpc: string, method: string, params: any[] = []) {
-  const t0 = performance.now();
-  const res = await fetch(rpc, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
-  });
-  const json = await res.json();
-  const ms = Math.round(performance.now() - t0);
-  if (json.error) throw Object.assign(new Error(json.error.message || "RPC error"), { ms });
-  return { result: json.result, ms };
-}
-
-export async function pickHealthyRpc(): Promise<RpcHealth> {
-  for (const rpc of RPCS) {
-    try {
-      const { result, ms } = await rpcCall(rpc, "eth_blockNumber");
-      const blockNumber = parseInt(result, 16);
-      const status: RpcHealth["status"] = ms < 900 ? "green" : ms < 2200 ? "yellow" : "yellow";
-      return { status, rpc, blockNumber, ms };
-    } catch (e: any) {
-      // try next
-    }
+/**
+ * Preflight check: does this connected address have Base ETH?
+ * Many wallets show "not enough funds" for any bundling failure.
+ * This helps detect the genuinely-empty-balance case early.
+ */
+export async function hasBaseEth(address: `0x${string}`) {
+  try {
+    const bal = (await rpcCall("eth_getBalance", [address, "latest"])) as `0x${string}`;
+    // Treat < 0.00001 ETH as effectively empty
+    const n = BigInt(bal);
+    return n > 10_000_000_000_000n; // 1e13 wei
+  } catch {
+    // If RPC fails, don't block user; just return true so flow continues
+    return true;
   }
-  return { status: "red", rpc: RPCS[0], note: "RPC unreachable" };
-}
-
-export async function rpcBlockNumber(rpc: string) {
-  const { result } = await rpcCall(rpc, "eth_blockNumber");
-  return parseInt(result, 16);
-}
-
-export async function rpcGetLogs(rpc: string, filter: any) {
-  const { result } = await rpcCall(rpc, "eth_getLogs", [filter]);
-  return result as any[];
-}
-
-export async function rpcGetTransactionReceipt(rpc: string, txHash: string) {
-  const { result } = await rpcCall(rpc, "eth_getTransactionReceipt", [txHash]);
-  return result as any;
 }
