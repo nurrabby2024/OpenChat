@@ -1,6 +1,6 @@
 import { Eip1193Provider } from "./wallet";
 
-export const CHAT_CONTRACT = "0xD4f66cBFA345C18Afc928a48f470566729bEEcA5";
+export const CHAT_CONTRACT = "0x2954ccf853ceb8fd330c1d2219bc557c5eabe3ec";
 export const BASE_CHAIN_ID = "0x2105";
 
 // Builder Code (Base Builder Codes)
