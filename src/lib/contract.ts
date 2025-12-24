@@ -4,7 +4,7 @@ export const CHAT_CONTRACT = "0xD4f66cBFA345C18Afc928a48f470566729bEEcA5";
 export const BASE_CHAIN_ID = "0x2105";
 
 // Builder Code (Base Builder Codes)
-export const BUILDER_CODE = "bc_openchat_nurrabby_20251225";
+export const BUILDER_CODE = "bc_rlbxoel7";
 
 export type ContractShape = {
   abi: any[];
