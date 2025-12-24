@@ -3,19 +3,19 @@ import { Eip1193Provider } from "./wallet";
 export const CHAT_CONTRACT = "0xD4f66cBFA345C18Afc928a48f470566729bEEcA5";
 export const BASE_CHAIN_ID = "0x2105";
 
-// Builder Code
+// Builder Code (Base Builder Codes)
 export const BUILDER_CODE = "bc_rlbxoel7";
 
 export type ContractShape = {
-  methodId: `0x${string}`;      // 0x + 8 hex
-  methodCall?: string;          // e.g. "sendMessage(string message)"
-  fnName: string;               // parsed
-  inputTypes: string[];         // parsed types
+  selector: `0x${string}`;          // 4-byte selector, e.g. 0x12345678
+  argType: "string" | "bytes";      // dynamic arg type (encoding same style)
 };
 
 const SHAPE_URL = "/api/shape";
 
 export async function fetchContractShape(from: string): Promise<ContractShape> {
+  if (!from || !from.startsWith("0x")) throw new Error("FROM_REQUIRED");
+
   const res = await fetch(SHAPE_URL, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -24,88 +24,79 @@ export async function fetchContractShape(from: string): Promise<ContractShape> {
   });
 
   const json: any = await res.json().catch(() => null);
-  if (!json || json.status !== "1" || !json.result?.methodId) {
+
+  if (!json || json.status !== "1" || !json.result?.selector) {
     throw new Error(json?.message || "SHAPE_UNAVAILABLE");
   }
 
-  const methodId = String(json.result.methodId);
-  const methodCall = String(json.result.methodCall || "");
-  const parsed = parseMethodCall(methodCall);
-
-  return {
-    methodId: methodId as `0x${string}`,
-    methodCall,
-    fnName: parsed.fnName,
-    inputTypes: parsed.inputTypes,
-  };
-}
-
-function parseMethodCall(methodCall: string): { fnName: string; inputTypes: string[] } {
-  // Examples from Blockscout: "transferFrom(address _from, address _to, uint256 _value)" :contentReference[oaicite:5]{index=5}
-  // We only need types list.
-  const s = (methodCall || "").trim();
-  const open = s.indexOf("(");
-  const close = s.lastIndexOf(")");
-  if (open <= 0 || close <= open) {
-    // fallback: unknown signature; assume single string
-    return { fnName: "unknown", inputTypes: ["string"] };
+  const selector = String(json.result.selector);
+  if (!selector.startsWith("0x") || selector.length !== 10) {
+    throw new Error("INVALID_SELECTOR");
   }
 
-  const fnName = s.slice(0, open).trim() || "unknown";
-  const inside = s.slice(open + 1, close).trim();
-  if (!inside) return { fnName, inputTypes: [] };
-
-  const parts = inside.split(",").map((p) => p.trim()).filter(Boolean);
-  // "string message" -> "string"
-  const inputTypes = parts.map((p) => p.split(/\s+/)[0]).filter(Boolean);
-
-  return { fnName, inputTypes };
+  return {
+    selector: selector as `0x${string}`,
+    argType: json.result.argType === "bytes" ? "bytes" : "string",
+  };
 }
 
 export async function buildDataSuffix(): Promise<string> {
   const { Attribution } = await import("https://esm.sh/ox/erc8021");
-  return Attribution.toDataSuffix({ codes: [BUILDER_CODE] }) as string;
+  const dataSuffix = Attribution.toDataSuffix({
+    codes: [BUILDER_CODE],
+  });
+  return dataSuffix as string;
+}
+
+function pad32(hexNo0x: string) {
+  return hexNo0x.padStart(64, "0");
+}
+
+function utf8ToHex(s: string) {
+  const bytes = new TextEncoder().encode(s);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ABI encoding for single dynamic param (string or bytes):
+// head: offset(0x20)
+// tail: length + data padded
+function encodeSingleDynamic(message: string) {
+  const headOffset = pad32("20");
+  const dataHex = utf8ToHex(message);
+  const lenBytes = dataHex.length / 2;
+  const lenWord = pad32(lenBytes.toString(16));
+  const padded = dataHex.padEnd(Math.ceil(dataHex.length / 64) * 64, "0");
+  return headOffset + lenWord + padded;
 }
 
 export async function encodeSendData(shape: ContractShape, message: string): Promise<string> {
-  const viem = await import("https://esm.sh/viem");
-  const { encodeFunctionData } = viem as any;
-
-  // We ONLY support a single dynamic string/bytes input for chat message.
-  // If contract uses different signature, we must update mapping.
-  if (shape.inputTypes.length !== 1) {
-    throw new Error("UNSUPPORTED_SIGNATURE");
-  }
-
-  const t = shape.inputTypes[0];
-  if (t !== "string" && t !== "bytes") {
-    throw new Error("UNSUPPORTED_ARG_TYPE");
-  }
-
-  const abi = [{
-    type: "function",
-    name: shape.fnName,
-    stateMutability: "nonpayable",
-    inputs: [{ name: "message", type: t }],
-    outputs: [],
-  }];
-
-  return encodeFunctionData({
-    abi,
-    functionName: shape.fnName,
-    args: [t === "bytes" ? (new TextEncoder().encode(message)) : message],
-  });
+  const tail = encodeSingleDynamic(message);
+  return (shape.selector + tail) as string;
 }
 
-export async function walletSendCalls(provider: Eip1193Provider, from: string, chainId: string, to: string, data: string, dataSuffix: string) {
+export async function walletSendCalls(
+  provider: Eip1193Provider,
+  from: string,
+  chainId: string,
+  to: string,
+  data: string,
+  dataSuffix: string
+) {
   const payload = {
     version: "2.0.0",
     from,
     chainId,
     atomicRequired: true,
-    calls: [{ to, value: "0x0", data }],
+    calls: [
+      {
+        to,
+        value: "0x0",
+        data,
+      },
+    ],
     capabilities: { dataSuffix },
   };
+
   return provider.request({ method: "wallet_sendCalls", params: [payload] });
 }
 
