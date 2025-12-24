@@ -1,407 +1,165 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ToastProvider, useToast } from "./toast";
-import { TopBar } from "./TopBar";
-import { Chat } from "./Chat";
-import { Composer } from "./Composer";
-import { ConnectModal } from "./ConnectModal";
-import { ChatMessage } from "../lib/types";
-import { getProvider, requestAccounts, ensureBaseChain, Eip1193Provider } from "../lib/wallet";
-import { pickHealthyRpc, rpcGetTransactionReceipt } from "../lib/health";
-import { CHAT_CONTRACT, fetchContractShape, buildDataSuffix, encodeSendData, walletSendCalls, walletGetCallsStatus, appendDataSuffix } from "../lib/contract";
-import { shortAddr } from "../lib/format";
+import { useEffect, useMemo, useState } from "react";
+import { encodeAbiParameters } from "viem";
+import { buildCalldata, sendCallsWithFallback, sendTransactionFallback } from "../lib/contract";
+import { hasBaseEth } from "../lib/health";
 
-function AppInner() {
-  const toast = useToast();
+type Shape = { selector: `0x${string}` };
 
-  const [provider, setProvider] = useState<Eip1193Provider | null>(null);
-  const [account, setAccount] = useState<string>("");
-  const [chainId, setChainId] = useState<string>("");
-  const [rpc, setRpc] = useState<string>("https://mainnet.base.org");
-  const [rpcStatus, setRpcStatus] = useState<"green" | "yellow" | "red">("yellow");
-  const [rpcNote, setRpcNote] = useState<string>("");
+async function fetchShape(): Promise<Shape> {
+  const r = await fetch("/api/shape");
+  if (!r.ok) throw new Error("shape fetch failed");
+  return r.json();
+}
 
-  const [shapeReady, setShapeReady] = useState(false);
-  const [contractError, setContractError] = useState<string>("");
-  const shapeRef = useRef<any>(null);
-  const dataSuffixRef = useRef<string>("");
+async function fetchTx(): Promise<{ to: `0x${string}`; dataSuffix?: `0x${string}`; value?: `0x${string}` }> {
+  const r = await fetch("/api/tx");
+  if (!r.ok) throw new Error("tx fetch failed");
+  return r.json();
+}
 
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [loading, setLoading] = useState(true);
+export default function App() {
+  const [ethereum, setEthereum] = useState<any>(null);
+  const [account, setAccount] = useState<`0x${string}` | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [toast, setToast] = useState<string | null>(null);
 
-  const [filters, setFilters] = useState({ onlyMine: false, showPending: true, search: "" });
-  const [isConnectOpen, setIsConnectOpen] = useState(false);
-  const [reducedMotion, setReducedMotion] = useState<boolean>(() => window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false);
-
-  // DAILY_CLEAR_OPENCHAT: reset in-memory message list at local midnight (reduces memory in long sessions)
   useEffect(() => {
-    const now = new Date();
-    const next = new Date(now);
-    next.setHours(24, 0, 0, 0);
-    const msToMidnight = next.getTime() - now.getTime();
-    const t0 = window.setTimeout(() => {
-      setMessages([]);
-    }, msToMidnight);
-    return () => window.clearTimeout(t0);
+    const eth = (window as any)?.ethereum;
+    setEthereum(eth || null);
   }, []);
 
-  // Farcaster SDK ready (must be called)
   useEffect(() => {
-    (async () => {
-      try {
-        const mod: any = await import("https://esm.sh/@farcaster/miniapp-sdk");
-        const sdk = mod?.default ?? mod;
-        if (sdk?.actions?.ready) sdk.actions.ready();
+    let t: any;
+    if (toast) {
+      t = setTimeout(() => setToast(null), 3500);
+    }
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  async function connect() {
+    try {
+      if (!ethereum) {
+        setToast("No wallet found");
         return;
-      } catch {}
-      try {
-        const mod: any = await import("https://esm.sh/@farcaster/frame-sdk");
-        const sdk = mod?.default ?? mod;
-        if (sdk?.actions?.ready) sdk.actions.ready();
-      } catch {}
-    })();
-  }, []);
-
-  // pick RPC and health
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const h = await pickHealthyRpc();
-      if (!alive) return;
-      setRpc(h.rpc);
-      setRpcStatus(h.status);
-      setRpcNote(h.status === "red" ? (h.note || "RPC issue") : h.ms ? `${h.ms}ms` : "");
-    })();
-    const t = window.setInterval(async () => {
-      const h = await pickHealthyRpc();
-      if (!alive) return;
-      setRpc(h.rpc);
-      setRpcStatus(h.status);
-      setRpcNote(h.status === "red" ? (h.note || "RPC issue") : h.ms ? `${h.ms}ms` : "");
-    }, 12000);
-    return () => { alive = false; window.clearInterval(t); };
-  }, []);
-
-  // provider boot
-  useEffect(() => {
-    (async () => {
-      const p = await getProvider();
-      setProvider(p);
-      if (!p) {
-        toast.push({ title: "Wallet provider not found", detail: "Open in a wallet-enabled Farcaster Mini App environment.", kind: "warn" });
       }
-      try {
-        const cid = p ? await p.request({ method: "eth_chainId" }) : "";
-        setChainId(cid || "");
-      } catch {}
-    })();
-  }, [toast]);
-
-  // listen account/chain changes
-  useEffect(() => {
-    if (!provider?.on) return;
-    const onAccounts = (a: string[]) => setAccount(a?.[0] ?? "");
-    const onChain = (c: string) => setChainId(c);
-    provider.on("accountsChanged", onAccounts);
-    provider.on("chainChanged", onChain);
-    return () => {
-      try { provider.removeListener?.("accountsChanged", onAccounts); } catch {}
-      try { provider.removeListener?.("chainChanged", onChain); } catch {}
-    };
-  }, [provider]);
-
-  // ✅ Contract shape + builder suffix load (ONLY when account exists)
-  useEffect(() => {
-    let alive = true;
-
-    const run = async (attempt = 0) => {
-      try {
-        if (!account) {
-          // reset when user disconnects
-          if (!alive) return;
-          setShapeReady(false);
-          setContractError("");
-          shapeRef.current = null;
-          return;
-        }
-
-        setContractError("");
-        setShapeReady(false);
-
-        const shape = await fetchContractShape(account);
-        const suffix = await buildDataSuffix();
-
-        if (!alive) return;
-        shapeRef.current = shape;
-        dataSuffixRef.current = suffix;
-        setShapeReady(true);
-      } catch (e: any) {
-        if (!alive) return;
-        setShapeReady(false);
-        setContractError(e?.message || "CONTRACT_UNAVAILABLE");
-        if (attempt < 3) {
-          setTimeout(() => run(attempt + 1), 900 + attempt * 600);
-          return;
-        }
-      }
-    };
-
-    run(0);
-    return () => { alive = false; };
-  }, [account]);
-
-  // Initial messages load (via /api/messages)
-  useEffect(() => {
-    let alive = true;
-
-    const load = async () => {
-      setLoading(true);
-      try {
-        const r = await fetch(`/api/messages?limit=15`, { headers: { accept: "application/json" }, cache: "no-store" });
-        const j: any = await r.json().catch(() => null);
-        const items = Array.isArray(j?.items) ? j.items : [];
-
-        const confirmed: ChatMessage[] = items.map((m: any) => ({
-          id: m.txHash,
-          createdAtMs: m.timestamp ? new Date(m.timestamp).getTime() : Date.now(),
-          from: m.from,
-          text: m.text,
-          status: "confirmed",
-          txHash: m.txHash,
-        }));
-
-        if (!alive) return;
-
-        setMessages((prev) => {
-          const locals = prev.filter((x) => x.status !== "confirmed");
-          return dedupeAndSort([...confirmed, ...locals]);
-        });
-      } catch (e: any) {
-        toast.push({ title: "Failed to load chat", detail: e?.message || "Explorer issue", kind: "warn" });
-      } finally {
-        if (alive) setLoading(false);
-      }
-    };
-
-    load();
-    const t = setInterval(load, 6000);
-    return () => { alive = false; clearInterval(t); };
-  }, [toast]);
-
-  const connectedLabel = account ? `Connected • ${shortAddr(account)}` : "Not connected";
-
-  const onConnect = async () => {
-    try {
-      if (!provider) throw new Error("No wallet provider");
-      const a = await requestAccounts(provider);
+      const accs = (await ethereum.request({ method: "eth_requestAccounts" })) as string[];
+      const a = (accs?.[0] || null) as any;
       setAccount(a);
-      const cid = await ensureBaseChain(provider);
-      setChainId(cid);
-      toast.push({ title: "Wallet connected", detail: shortAddr(a), kind: "ok" });
-      setIsConnectOpen(false);
     } catch (e: any) {
-      toast.push({ title: "Connect failed", detail: e?.message || "User rejected", kind: "warn" });
+      setToast(e?.message || "Connect failed");
     }
-  };
+  }
 
-  const sendMessage = async (text: string) => {
+  async function send() {
+    if (!ethereum) return setToast("No wallet found");
+    if (!account) return setToast("Connect wallet first");
+    if (!msg.trim()) return setToast("Write a message");
+
+    setLoading(true);
     try {
-      if (!provider) throw new Error("No wallet provider");
-
-      // ✅ First: require wallet
-      if (!account) {
-        setIsConnectOpen(true);
-        return { ok: false as const };
+      // Preflight check - avoids the "I have $5 but still says no gas" confusion
+      const okBal = await hasBaseEth(account);
+      if (!okBal) {
+        setToast("No Base ETH in this connected address");
+        setLoading(false);
+        return;
       }
 
-      // ✅ Then: require contract shape
-      if (!shapeReady) {
-        toast.push({
-          title: contractError ? "Contract unavailable" : "Still loading contract",
-          detail: contractError ? contractError : "Try again in a second.",
-          kind: "warn",
-        });
-        return { ok: false as const };
-      }
+      const shape = await fetchShape();
+      const txMeta = await fetchTx();
 
-      const cid = await ensureBaseChain(provider);
-      setChainId(cid);
+      // abi-encode single string arg
+      const encodedArgs = encodeAbiParameters([{ type: "string" }], [msg]) as `0x${string}`;
+      const data = buildCalldata(shape.selector, encodedArgs);
 
-      const data = await encodeSendData(shapeRef.current, text);
-      const dataSuffix = dataSuffixRef.current;
-
-      // Preferred path: ERC-5792 (wallet_sendCalls). Some wallets surface confusing "no gas" errors
-      // when they fail to build/estimate the call bundle. If that happens, fall back to a plain
-      // eth_sendTransaction with the attribution suffix appended to calldata.
-      let usedFallbackTx = false;
-      let callId = "";
-      let txHash: string | undefined;
-      try {
-        const result = await walletSendCalls(provider, account, cid, CHAT_CONTRACT, data, dataSuffix);
-        callId = typeof result === "string" ? result : (result?.id || result?.callId || `${Date.now()}`);
-      } catch (e: any) {
-        const msg = String(e?.message || "");
-        const code = e?.code;
-        const looksLikeBuildOrFunds =
-          code === -32000 ||
-          /insufficient funds/i.test(msg) ||
-          /error generating transaction/i.test(msg) ||
-          /funds/i.test(msg) ||
-          /gas/i.test(msg);
-
-        if (!looksLikeBuildOrFunds) throw e;
-
-        // Fallback: plain transaction (works on more wallets) while keeping Builder Code attribution.
-        const dataWithSuffix = appendDataSuffix(data, dataSuffix);
-        txHash = await provider.request({
-          method: "eth_sendTransaction",
-          params: [{ from: account, to: CHAT_CONTRACT, value: "0x0", data: dataWithSuffix }],
-        });
-        usedFallbackTx = true;
-        callId = txHash || `${Date.now()}`;
-      }
-
-      const localId = `local:${callId}`;
-      const now = Date.now();
-
-      setMessages((prev) => dedupeAndSort([...prev, {
-        id: localId,
-        createdAtMs: now,
+      // Primary path: wallet_sendCalls with 2-mode fallback
+      const res1 = await sendCallsWithFallback(ethereum, {
         from: account,
-        text,
-        status: "pending",
-      }]));
-
-      const t0 = Date.now();
-
-      for (let i = 0; i < 90; i++) {
-        await sleep(1100);
-
-        // If we used wallet_sendCalls, attempt to fetch the eventual tx hash via wallet_getCallsStatus.
-        if (!usedFallbackTx) {
-          try {
-            const status = await walletGetCallsStatus(provider, callId);
-            const hashes: string[] =
-              status?.transactionHashes ||
-              status?.txHashes ||
-              status?.receipts?.map((r: any) => r.transactionHash) ||
-              status?.calls?.flatMap((c: any) => c.transactionHash ? [c.transactionHash] : []) ||
-              [];
-            txHash = hashes?.[0] || txHash;
-
-            const done = status?.status === "CONFIRMED" || status?.status === "confirmed" || status?.status === "SUCCESS";
-            const failed = status?.status === "FAILED" || status?.status === "failed" || status?.status === "REVERTED";
-
-            if (failed) throw new Error(status?.error?.message || "Transaction failed");
-            if (done && txHash) break;
-          } catch {
-            // Some wallets don't support wallet_getCallsStatus
-          }
-        }
-
-        // Always try receipt polling once we have a tx hash (or if we used the fallback).
-        if (txHash) {
-          const r = await rpcGetTransactionReceipt(rpc, txHash);
-          if (r?.status === "0x1") break;
-          if (r?.status === "0x0") throw new Error("Transaction reverted");
-        }
-
-        const elapsed = Math.floor((Date.now() - t0) / 1000);
-        setMessages((prev) => prev.map((m) => m.id === localId ? ({ ...m, error: `pending • ${elapsed}s` }) : m));
-      }
-
-      setMessages((prev) => prev.map((m) => m.id === localId ? ({ ...m, status: "confirmed", txHash }) : m));
-      toast.push({ title: "Confirmed on Base", detail: txHash ? shortAddr(txHash) : "Mined", kind: "ok" });
-      return { ok: true as const };
-
-    } catch (e: any) {
-      const msg = e?.message || "Failed";
-      if (String(msg).toLowerCase().includes("user rejected") || e?.code === 4001) {
-        toast.push({ title: "Cancelled", detail: "Transaction was rejected", kind: "warn" });
-        return { ok: false as const, cancelled: true as const };
-      }
-      toast.push({
-        title: "Failed — retry",
-        detail:
-          (String(msg).includes("wallet_sendCalls") ||
-            String(msg).toLowerCase().includes("method not found") ||
-            String(msg).includes("-32601"))
-            ? "Your current wallet doesn't support wallet_sendCalls. Open this in the Base App / a Farcaster Mini App wallet environment to publish onchain."
-            : msg,
-        kind: "err",
+        to: txMeta.to,
+        data,
+        value: txMeta.value,
+        dataSuffix: txMeta.dataSuffix,
       });
-      return { ok: false as const, error: msg };
-    }
-  };
 
-  const displayed = useMemo(() => {
-    const mine = account?.toLowerCase();
-    return messages.filter((m) => {
-      if (!filters.showPending && m.status === "pending") return false;
-      if (filters.onlyMine && mine && m.from.toLowerCase() !== mine) return false;
-      if (filters.search) {
-        const q = filters.search.toLowerCase();
-        return m.text.toLowerCase().includes(q) || m.from.toLowerCase().includes(q);
+      if (res1.ok) {
+        setToast(`Sent (${res1.mode})`);
+        setMsg("");
+        setLoading(false);
+        return;
       }
-      return true;
-    });
-  }, [messages, filters, account]);
+
+      // Final fallback: eth_sendTransaction
+      const res2 = await sendTransactionFallback(ethereum, {
+        from: account,
+        to: txMeta.to,
+        data,
+        value: txMeta.value,
+        dataSuffix: txMeta.dataSuffix,
+      });
+
+      if (res2.ok) {
+        setToast(`Sent (${res2.mode})`);
+        setMsg("");
+        setLoading(false);
+        return;
+      }
+
+      // If everything failed, show wallet error message
+      const errMsg =
+        res2.error?.message ||
+        res1.error?.message ||
+        "Error generating transaction";
+      setToast(errMsg);
+    } catch (e: any) {
+      setToast(e?.message || "Send failed");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
-    <div className="h-full flex flex-col">
-      <TopBar
-        handle={account ? shortAddr(account) : "guest"}
-        connectedLabel={connectedLabel}
-        status={rpcStatus}
-        statusNote={rpcNote}
-        onConnect={() => setIsConnectOpen(true)}
-        filters={filters}
-        setFilters={setFilters}
-        reducedMotion={reducedMotion}
-        setReducedMotion={setReducedMotion}
-      />
+    <div style={{ padding: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+        <div>OpenChat</div>
+        <button onClick={connect} disabled={!!account}>
+          {account ? `${account.slice(0, 6)}…${account.slice(-4)}` : "Connect"}
+        </button>
+      </div>
 
-      <Chat
-        loading={loading}
-        messages={displayed}
-        myAddress={account}
-        reducedMotion={reducedMotion}
-        rpcExplorerBase="/api/tx?hash="
-      />
+      <div style={{ marginTop: 12 }}>
+        <input
+          value={msg}
+          onChange={(e) => setMsg(e.target.value)}
+          placeholder="Write message…"
+          style={{ width: "100%", padding: 12, borderRadius: 10 }}
+        />
+        <button
+          onClick={send}
+          disabled={loading}
+          style={{ marginTop: 10, width: "100%", padding: 12, borderRadius: 10 }}
+        >
+          {loading ? "Sending…" : "Send"}
+        </button>
+      </div>
 
-      <Composer
-        disabled={!provider}
-        connected={!!account}
-        onConnect={() => setIsConnectOpen(true)}
-        onSend={sendMessage}
-        myAddress={account}
-        chainId={chainId}
-        reducedMotion={reducedMotion}
-      />
-
-      <ConnectModal
-        open={isConnectOpen}
-        onClose={() => setIsConnectOpen(false)}
-        onConnect={onConnect}
-        canConnect={!!provider}
-      />
+      {toast && (
+        <div
+          style={{
+            position: "fixed",
+            left: 16,
+            right: 16,
+            bottom: 18,
+            background: "#111",
+            color: "#fff",
+            padding: 12,
+            borderRadius: 10,
+            opacity: 0.95,
+          }}
+        >
+          {toast}
+        </div>
+      )}
     </div>
-  );
-}
-
-function dedupeAndSort(items: ChatMessage[]) {
-  const map = new Map<string, ChatMessage>();
-  for (const m of items) map.set(m.id, m);
-  const arr = Array.from(map.values());
-  arr.sort((a, b) => a.createdAtMs - b.createdAtMs);
-  return arr;
-}
-
-function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
-
-export function App() {
-  return (
-    <ToastProvider>
-      <AppInner />
-    </ToastProvider>
   );
 }
