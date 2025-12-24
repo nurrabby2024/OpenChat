@@ -15,23 +15,39 @@ export type ContractShape = {
 
 const SHAPE_URL = "/api/shape";
 
-export async function fetchContractShape(): Promise<ContractShape> {
-  const res = await fetch(SHAPE_URL, { headers: { accept: "application/json" }, cache: "no-store" });
+const SHAPE_URL = "/api/shape";
+
+export async function fetchContractShape(from: string): Promise<ContractShape> {
+  if (!from || !from.startsWith("0x") || from.length < 10) {
+    throw new Error("FROM_REQUIRED");
+  }
+
+  const res = await fetch(SHAPE_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ from }),
+    cache: "no-store",
+  });
+
   const json: any = await res.json().catch(() => null);
+
   if (!json || json.status !== "1" || !json.result?.abi || !json.result?.sendFnName) {
     const msg = json?.message || "SHAPE_UNAVAILABLE";
     const detail = json?.result?.methodCall ? ` (${json.result.methodCall})` : "";
     throw new Error(`${msg}${detail}`);
   }
+
   const abi = JSON.parse(json.result.abi);
   if (!Array.isArray(abi)) throw new Error("INVALID_SHAPE_ABI");
+
   return {
     abi,
     sendFnName: String(json.result.sendFnName),
-    argType: (json.result.argType === "bytes" ? "bytes" : "string"),
+    argType: json.result.argType === "bytes" ? "bytes" : "string",
     methodCall: json.result.methodCall ? String(json.result.methodCall) : undefined,
   };
 }
+
 
 export async function buildDataSuffix(): Promise<string> {
   const { Attribution } = await import("https://esm.sh/ox/erc8021");
