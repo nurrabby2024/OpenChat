@@ -7,20 +7,14 @@ export const BASE_CHAIN_ID = "0x2105";
 export const BUILDER_CODE = "bc_rlbxoel7";
 
 export type ContractShape = {
-  abi: any[];
-  sendFnName: string;
-  argType: "string" | "bytes";
-  methodCall?: string;
+  selector: `0x${string}`;          // 4-byte selector, e.g. 0x12345678
+  argType: "string" | "bytes";      // dynamic arg type (encoding same style)
 };
 
 const SHAPE_URL = "/api/shape";
 
-const SHAPE_URL = "/api/shape";
-
 export async function fetchContractShape(from: string): Promise<ContractShape> {
-  if (!from || !from.startsWith("0x") || from.length < 10) {
-    throw new Error("FROM_REQUIRED");
-  }
+  if (!from || !from.startsWith("0x")) throw new Error("FROM_REQUIRED");
 
   const res = await fetch(SHAPE_URL, {
     method: "POST",
@@ -31,23 +25,20 @@ export async function fetchContractShape(from: string): Promise<ContractShape> {
 
   const json: any = await res.json().catch(() => null);
 
-  if (!json || json.status !== "1" || !json.result?.abi || !json.result?.sendFnName) {
-    const msg = json?.message || "SHAPE_UNAVAILABLE";
-    const detail = json?.result?.methodCall ? ` (${json.result.methodCall})` : "";
-    throw new Error(`${msg}${detail}`);
+  if (!json || json.status !== "1" || !json.result?.selector) {
+    throw new Error(json?.message || "SHAPE_UNAVAILABLE");
   }
 
-  const abi = JSON.parse(json.result.abi);
-  if (!Array.isArray(abi)) throw new Error("INVALID_SHAPE_ABI");
+  const selector = String(json.result.selector);
+  if (!selector.startsWith("0x") || selector.length !== 10) {
+    throw new Error("INVALID_SELECTOR");
+  }
 
   return {
-    abi,
-    sendFnName: String(json.result.sendFnName),
+    selector: selector as `0x${string}`,
     argType: json.result.argType === "bytes" ? "bytes" : "string",
-    methodCall: json.result.methodCall ? String(json.result.methodCall) : undefined,
   };
 }
-
 
 export async function buildDataSuffix(): Promise<string> {
   const { Attribution } = await import("https://esm.sh/ox/erc8021");
@@ -57,27 +48,52 @@ export async function buildDataSuffix(): Promise<string> {
   return dataSuffix as string;
 }
 
-export async function encodeSendData(shape: ContractShape, message: string): Promise<string> {
-  const viem = await import("https://esm.sh/viem");
-  const { encodeFunctionData } = viem as any;
-  return encodeFunctionData({
-    abi: shape.abi,
-    functionName: shape.sendFnName,
-    args: [message],
-  });
+function pad32(hexNo0x: string) {
+  return hexNo0x.padStart(64, "0");
 }
 
-export async function walletSendCalls(provider: Eip1193Provider, from: string, chainId: string, to: string, data: string, dataSuffix: string) {
+function utf8ToHex(s: string) {
+  const bytes = new TextEncoder().encode(s);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ABI encoding for single dynamic param (string or bytes):
+// head: offset(0x20)
+// tail: length + data padded
+function encodeSingleDynamic(message: string) {
+  const headOffset = pad32("20");
+  const dataHex = utf8ToHex(message);
+  const lenBytes = dataHex.length / 2;
+  const lenWord = pad32(lenBytes.toString(16));
+  const padded = dataHex.padEnd(Math.ceil(dataHex.length / 64) * 64, "0");
+  return headOffset + lenWord + padded;
+}
+
+export async function encodeSendData(shape: ContractShape, message: string): Promise<string> {
+  const tail = encodeSingleDynamic(message);
+  return (shape.selector + tail) as string;
+}
+
+export async function walletSendCalls(
+  provider: Eip1193Provider,
+  from: string,
+  chainId: string,
+  to: string,
+  data: string,
+  dataSuffix: string
+) {
   const payload = {
     version: "2.0.0",
     from,
     chainId,
     atomicRequired: true,
-    calls: [{
-      to,
-      value: "0x0",
-      data,
-    }],
+    calls: [
+      {
+        to,
+        value: "0x0",
+        data,
+      },
+    ],
     capabilities: { dataSuffix },
   };
 
