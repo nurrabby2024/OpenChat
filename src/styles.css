@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root{
+  color-scheme: dark;
+  --bg:#05080a;
+  --accent:#7dffcf;
+}
+
+html,body{
+  height:100%;
+  background: radial-gradient(1200px 800px at 50% -20%, rgba(125,255,207,0.10), transparent 55%),
+              radial-gradient(900px 600px at 110% 10%, rgba(125,255,207,0.06), transparent 55%),
+              var(--bg);
+  overflow:hidden;
+}
+
+#root{
+  height:100%;
+}
+
+#scanline-overlay{
+  position:fixed;
+  inset:0;
+  pointer-events:none;
+  background:
+    linear-gradient(to bottom, rgba(255,255,255,0.025), rgba(255,255,255,0.00) 18%, rgba(255,255,255,0.02) 36%, rgba(255,255,255,0.00) 54%, rgba(255,255,255,0.015) 72%, rgba(255,255,255,0.00) 100%),
+    url("/assets/noise.png");
+  opacity:0.045;
+  mix-blend-mode: overlay;
+}
+
+@media (prefers-reduced-motion: reduce){
+  *{ scroll-behavior:auto !important; animation:none !important; transition:none !important; }
+}
