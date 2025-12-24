@@ -1,0 +1,19 @@
+{
+  "version": "1",
+  "miniapp": {
+    "name": "OpenChat",
+    "description": "Premium terminal-themed onchain public chat on Base.",
+    "homeUrl": "https://nurrabby.com/",
+    "iconUrl": "https://nurrabby.com/assets/icon.png",
+    "imageUrl": "https://nurrabby.com/assets/embed-3x2.png",
+    "splashImageUrl": "https://nurrabby.com/assets/splash.png",
+    "splashBackgroundColor": "#05080a",
+    "primaryCategory": "social",
+    "tags": [
+      "chat",
+      "base",
+      "onchain",
+      "terminal"
+    ]
+  }
+}
