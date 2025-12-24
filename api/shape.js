@@ -1,12 +1,82 @@
 // /api/shape
-// Uses Blockscout API to find recent successful tx TO the contract and extract method_id/method_call.
-// No ABI needed.
+// Returns the most common 4-byte selector used in recent txs sent to the chat contract.
+// Does NOT require verified ABI.
 
 const ADDRESS = "0xD4f66cBFA345C18Afc928a48f470566729bEEcA5";
-const BS_BASE = "https://base.blockscout.com/api/v2";
+const BASE_RPC = "https://mainnet.base.org";
 
-function okAddr(a) {
-  return typeof a === "string" && a.toLowerCase().startsWith("0x") && a.length === 42;
+async function rpc(method, params = []) {
+  const r = await fetch(BASE_RPC, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  const j = await r.json().catch(() => null);
+  if (!j) throw new Error("RPC_BAD_RESPONSE");
+  if (j.error) throw new Error(j.error.message || "RPC_ERROR");
+  return j.result;
+}
+
+function extractSelectorsFromBytecode(codeHex) {
+  const code = (codeHex || "").startsWith("0x") ? codeHex.slice(2) : (codeHex || "");
+  const out = new Set();
+  for (let i = 0; i + 10 <= code.length; i += 2) {
+    if (code.slice(i, i + 2) === "63") {
+      const sel = code.slice(i + 2, i + 10);
+      if (/^[0-9a-fA-F]{8}$/.test(sel)) out.add("0x" + sel.toLowerCase());
+    }
+  }
+  return Array.from(out);
+}
+
+async function selectorsFromRecentTxs() {
+  const latestHex = await rpc("eth_blockNumber", []);
+  const latest = parseInt(latestHex, 16);
+
+  let fromBlock = Math.max(0, latest - 20000);
+  let logs = [];
+
+  for (let tries = 0; tries < 6; tries++) {
+    try {
+      logs = await rpc("eth_getLogs", [
+        {
+          address: ADDRESS,
+          fromBlock: "0x" + fromBlock.toString(16),
+          toBlock: "0x" + latest.toString(16),
+        },
+      ]);
+      if (Array.isArray(logs) && logs.length) break;
+    } catch {}
+    fromBlock = Math.max(0, fromBlock - 20000);
+  }
+
+  const txHashes = [];
+  const seen = new Set();
+  for (const l of logs || []) {
+    const h = (l?.transactionHash || "").toLowerCase();
+    if (h && !seen.has(h)) {
+      seen.add(h);
+      txHashes.push(h);
+    }
+    if (txHashes.length >= 40) break;
+  }
+
+  const counts = new Map();
+  for (const h of txHashes) {
+    try {
+      const tx = await rpc("eth_getTransactionByHash", [h]);
+      if (!tx?.to) continue;
+      if (String(tx.to).toLowerCase() !== ADDRESS.toLowerCase()) continue;
+      const input = String(tx.input || "");
+      if (!input.startsWith("0x") || input.length < 10) continue;
+      const sel = input.slice(0, 10).toLowerCase();
+      counts.set(sel, (counts.get(sel) || 0) + 1);
+    } catch {}
+  }
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([sel]) => sel);
 }
 
 export default async function handler(req, res) {
@@ -17,46 +87,36 @@ export default async function handler(req, res) {
     }
 
     const body = req.body || {};
-    const from = String(body?.from || "");
-    if (!okAddr(from)) {
+    const from = String(body?.from || "").toLowerCase();
+    if (!from || !from.startsWith("0x") || from.length !== 42) {
       res.status(200).json({ status: "0", message: "FROM_REQUIRED", result: "" });
       return;
     }
 
-    // Fetch transactions for ADDRESS (filter=to means txs sent TO this address)
-    // Docs: /api/v2/addresses/{address_hash}/transactions?filter=to :contentReference[oaicite:2]{index=2}
-    const url = `${BS_BASE}/addresses/${ADDRESS}/transactions?filter=to`;
-    const r = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
-    const j = await r.json().catch(() => null);
+    // 1) Prefer real selectors from recent txs
+    let sels = await selectorsFromRecentTxs();
+    let selector = sels?.[0];
 
-    const items = Array.isArray(j?.items) ? j.items : [];
-    // Pick first "ok" tx with method_id + method_call
-    const good = items.find((tx) => {
-      const status = String(tx?.status || "").toLowerCase(); // "ok | error" :contentReference[oaicite:3]{index=3}
-      const mid = String(tx?.method_id || "");               // e.g. "23b872dd" :contentReference[oaicite:4]{index=4}
-      const mcall = String(tx?.method_call || tx?.method || "");
-      const raw = String(tx?.raw_input || "");
-      return status === "ok" && mid.length === 8 && mcall && raw.startsWith("0x") && raw.length >= 10;
-    });
+    // 2) Fallback: extract from bytecode
+    if (!selector) {
+      const code = await rpc("eth_getCode", [ADDRESS, "latest"]);
+      const b = extractSelectorsFromBytecode(code);
+      selector = b?.[0];
+    }
 
-    if (!good) {
-      res.setHeader("cache-control", "no-store");
-      res.status(200).json({ status: "0", message: "NO_OK_TX_FOUND", result: "" });
+    if (!selector) {
+      res.status(200).json({ status: "0", message: "NO_SELECTOR_FOUND", result: "" });
       return;
     }
 
-    const methodId = "0x" + String(good.method_id).toLowerCase(); // 4-byte selector
-    const methodCall = String(good.method_call || "");
-    const sampleTx = String(good.hash || "");
-
+    // Arg type: for dynamic arg encoding (string/bytes) encoding is same style.
     res.setHeader("cache-control", "no-store");
     res.status(200).json({
       status: "1",
       message: "OK",
       result: {
-        methodId,
-        methodCall,
-        sampleTx,
+        selector,
+        argType: "string",
       },
     });
   } catch (e) {
