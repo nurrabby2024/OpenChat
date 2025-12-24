@@ -1,0 +1,19 @@
+{
+  "version": "1",
+  "miniapp": {
+    "name": "OpenChat",
+    "description": "Premium terminal-themed onchain public chat on Base.",
+    "homeUrl": "https://open-chatx.vercel.app/",
+    "iconUrl": "https://open-chatx.vercel.app/assets/icon.png",
+    "imageUrl": "https://open-chatx.vercel.app/assets/embed-3x2.png",
+    "splashImageUrl": "https://open-chatx.vercel.app/assets/splash.png",
+    "splashBackgroundColor": "#05080a",
+    "primaryCategory": "social",
+    "tags": [
+      "chat",
+      "base",
+      "onchain",
+      "terminal"
+    ]
+  }
+}
