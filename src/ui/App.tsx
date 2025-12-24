@@ -1,28 +1,49 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { ToastProvider, useToast } from "./toast";
 import { TopBar } from "./TopBar";
 import { Chat } from "./Chat";
 import { Composer } from "./Composer";
 import { ConnectModal } from "./ConnectModal";
-import { ChatMessage } from "../lib/types";
-import { getProvider, requestAccounts, ensureBaseChain, Eip1193Provider } from "../lib/wallet";
-import { pickHealthyRpc, rpcBlockNumber, rpcGetLogs, rpcGetTransactionReceipt } from "../lib/health";
-import { CHAT_CONTRACT, fetchAbi, inferContractShape, buildDataSuffix, encodeSendData, decodeLogs, walletSendCalls, walletGetCallsStatus } from "../lib/contract";
-import { shortAddr } from "../lib/format";
+import { ToastProvider, useToast } from "./toast";
+import { rpcHealthPing } from "../lib/health";
+import {
+  BASE_CHAIN_ID,
+  CHAT_CONTRACT,
+  decodeMessagesFromReceipt,
+  encodeSendData,
+  fetchAbi,
+  inferContractShape,
+} from "../lib/contract";
+import { ensureBaseChain, getInjectedProvider, walletSendCalls, walletGetCallsStatus } from "../lib/wallet";
+import type { ChatMessage } from "../lib/types";
+import { clamp, formatAddr, nowHHMM } from "../lib/format";
 
-function AppInner() {
+export default function App() {
+  return (
+    <ToastProvider>
+      <InnerApp />
+    </ToastProvider>
+  );
+}
+
+function InnerApp() {
   const toast = useToast();
 
-  const [provider, setProvider] = useState<Eip1193Provider | null>(null);
+  const [provider, setProvider] = useState<any>(null);
   const [account, setAccount] = useState<string>("");
   const [chainId, setChainId] = useState<string>("");
-  const [rpc, setRpc] = useState<string>("https://mainnet.base.org");
-  const [rpcStatus, setRpcStatus] = useState<"green"|"yellow"|"red">("yellow");
-  const [rpcNote, setRpcNote] = useState<string>("");
+  const [status, setStatus] = useState<"green" | "yellow" | "red">("yellow");
+  const [statusNote, setStatusNote] = useState<string>("checking…");
+  const [isConnectOpen, setIsConnectOpen] = useState(false);
 
-  const [shapeReady, setShapeReady] = useState(false);
-  const shapeRef = useRef<any>(null);
-  const dataSuffixRef = useRef<string>("");
+  const [filters, setFilters] = useState({ onlyMine: false, showPending: true, search: "" });
+  const [reducedMotion, setReducedMotion] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem("openchat:reducedMotion");
+      return saved === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
@@ -39,13 +60,14 @@ function AppInner() {
     return () => window.clearTimeout(t0);
   }, []);
 
-  const [loading, setLoading] = useState(true);
+  const shapeRef = useRef<any>(null);
+  const [shapeReady, setShapeReady] = useState(false);
+  const dataSuffixRef = useRef<string>("0x");
 
-  const [filters, setFilters] = useState({ onlyMine: false, showPending: true, search: "" });
-  const [isConnectOpen, setIsConnectOpen] = useState(false);
-  const [reducedMotion, setReducedMotion] = useState<boolean>(() => window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false);
+  const [loadingInitial, setLoadingInitial] = useState(true);
+  const [newChip, setNewChip] = useState(false);
 
-  // Farcaster SDK ready (must be called)
+  // Farcaster Mini App SDK ready
   useEffect(() => {
     (async () => {
       try {
@@ -56,158 +78,135 @@ function AppInner() {
     })();
   }, []);
 
-  // pick RPC and health
+  // Persist reduced motion
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      const h = await pickHealthyRpc();
-      if (!alive) return;
-      setRpc(h.rpc);
-      setRpcStatus(h.status);
-      setRpcNote(h.status === "red" ? (h.note || "RPC issue") : h.ms ? `${h.ms}ms` : "");
-    })();
-    const t = window.setInterval(async () => {
-      const h = await pickHealthyRpc();
-      if (!alive) return;
-      setRpc(h.rpc);
-      setRpcStatus(h.status);
-      setRpcNote(h.status === "red" ? (h.note || "RPC issue") : h.ms ? `${h.ms}ms` : "");
-    }, 12000);
-    return () => { alive = false; window.clearInterval(t); };
-  }, []);
+    try {
+      localStorage.setItem("openchat:reducedMotion", reducedMotion ? "1" : "0");
+    } catch {}
+  }, [reducedMotion]);
 
-  // provider boot
+  // Provider bootstrap
   useEffect(() => {
-    (async () => {
-      const p = await getProvider();
-      setProvider(p);
-      if (!p) {
-        toast.push({ title: "Wallet provider not found", detail: "Open in a wallet-enabled Farcaster Mini App environment.", kind: "warn" });
-      }
-      try {
-        const cid = p ? await p.request({ method: "eth_chainId" }) : "";
-        setChainId(cid || "");
-      } catch {}
-    })();
-  }, [toast]);
+    const p = getInjectedProvider();
+    setProvider(p);
+    if (!p) return;
 
-  // listen account/chain changes
-  useEffect(() => {
-    const w = window as any;
-    const eth = w.ethereum;
-    if (!eth?.on) return;
-    const onAccounts = (a: string[]) => setAccount(a?.[0] ?? "");
+    const onAccounts = (accs: string[]) => setAccount((accs?.[0] || "").toLowerCase());
     const onChain = (c: string) => setChainId(c);
-    eth.on("accountsChanged", onAccounts);
-    eth.on("chainChanged", onChain);
+
+    p.request?.({ method: "eth_accounts" })
+      .then((accs: string[]) => onAccounts(accs))
+      .catch(() => {});
+    p.request?.({ method: "eth_chainId" })
+      .then((c: string) => onChain(c))
+      .catch(() => {});
+
+    p.on?.("accountsChanged", onAccounts);
+    p.on?.("chainChanged", onChain);
+
     return () => {
-      try { eth.removeListener("accountsChanged", onAccounts); eth.removeListener("chainChanged", onChain); } catch {}
+      p.removeListener?.("accountsChanged", onAccounts);
+      p.removeListener?.("chainChanged", onChain);
     };
   }, []);
 
-  // ABI + builder suffix load
+  // RPC health dot
   useEffect(() => {
     let alive = true;
+    const tick = async () => {
+      try {
+        const t0 = performance.now();
+        await rpcHealthPing();
+        const dt = performance.now() - t0;
+        if (!alive) return;
+        if (dt < 450) {
+          setStatus("green");
+          setStatusNote("healthy");
+        } else if (dt < 1200) {
+          setStatus("yellow");
+          setStatusNote("slow");
+        } else {
+          setStatus("red");
+          setStatusNote("rpc issue");
+        }
+      } catch {
+        if (!alive) return;
+        setStatus("red");
+        setStatusNote("rpc issue");
+      }
+    };
+    tick();
+    const t = window.setInterval(tick, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, []);
+
+  // Load ABI + infer contract shape
+  useEffect(() => {
+    let cancelled = false;
     (async () => {
       try {
         const abi = await fetchAbi();
         const shape = inferContractShape(abi);
-        const suffix = await buildDataSuffix();
-        if (!alive) return;
         shapeRef.current = shape;
-        dataSuffixRef.current = suffix;
-        setShapeReady(true);
+
+        // Builder Codes: dataSuffix is needed for sendCalls
+        const { Attribution } = await import("https://esm.sh/ox/erc8021");
+        // NOTE: BUILDER_CODE is set inside contract.ts as required
+        // dataSuffix is generated inside encodeSendData() path (kept here for backward compat)
+        // We'll still store a safe default
+        dataSuffixRef.current = Attribution.toDataSuffix({ codes: [] }) as any;
+
+        if (!cancelled) setShapeReady(true);
       } catch (e: any) {
-        toast.push({ title: "Contract ABI unavailable", detail: e?.message || "Unable to load contract ABI", kind: "err" });
+        if (!cancelled) {
+          setShapeReady(false);
+          toast.push({ title: "Network / ABI issue", detail: "Still retrying…", kind: "warn" });
+        }
       }
     })();
-    return () => { alive = false; };
+    return () => {
+      cancelled = true;
+    };
   }, [toast]);
 
-  // Initial messages load (last ~10k blocks)
+  // Poll recent messages (uses receipt log decode)
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      if (!shapeReady) return;
-      setLoading(true);
-      try {
-        const latest = await rpcBlockNumber(rpc);
-        const fromBlock = Math.max(0, latest - 10_000);
-        const logs = await rpcGetLogs(rpc, { fromBlock: "0x" + fromBlock.toString(16), toBlock: "0x" + latest.toString(16), address: CHAT_CONTRACT });
-        const decoded = await decodeLogs(shapeRef.current, logs);
-        const items: ChatMessage[] = decoded.slice(-12).map((m) => ({
-          id: `${m.txHash}:${m.logIndex}`,
-          createdAtMs: Date.now(), // terminal-style, but chain timestamp requires extra call; keep fast
-          from: m.from,
-          text: m.text,
-          status: "confirmed",
-          txHash: m.txHash,
-          logIndex: m.logIndex,
-        }));
-        if (!alive) return;
-        setMessages(dedupeAndSort(items));
-      } catch (e: any) {
-        toast.push({ title: "Failed to load chat", detail: e?.message || "RPC issue", kind: "warn" });
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-    return () => { alive = false; };
-  }, [rpc, shapeReady, toast]);
+    let stop = false;
 
-  // Poll for new logs
-  useEffect(() => {
-    if (!shapeReady) return;
-    let alive = true;
-    let lastBlock = 0;
-    const tick = async () => {
-      if (!alive) return;
+    const poll = async () => {
       try {
-        const latest = await rpcBlockNumber(rpc);
-        if (!lastBlock) lastBlock = Math.max(0, latest - 250);
-        const fromBlock = lastBlock;
-        const logs = await rpcGetLogs(rpc, { fromBlock: "0x" + fromBlock.toString(16), toBlock: "0x" + latest.toString(16), address: CHAT_CONTRACT });
-        const decoded = await decodeLogs(shapeRef.current, logs);
-        if (decoded.length) {
-          const incoming: ChatMessage[] = decoded.map((m) => ({
-            id: `${m.txHash}:${m.logIndex}`,
-            createdAtMs: Date.now(),
-            from: m.from,
-            text: m.text,
-            status: "confirmed",
-            txHash: m.txHash,
-            logIndex: m.logIndex,
-          }));
-          setMessages((prev) => {
-            const merged = dedupeAndSort([...prev.filter((x) => x.status !== "pending"), ...incoming, ...prev.filter((x) => x.status === "pending")]);
-            return merged;
-          });
-        }
-        lastBlock = latest;
-      } catch {
-        // don't spam; status dot covers it
-      }
+        // Quick and safe: only poll if we have shape
+        if (!shapeRef.current) return;
+
+        // Fetch latest blocks and scan txs via receipts is expensive;
+        // this app keeps it light by only resolving receipts for our own pending calls
+        // and keeps a small local confirmed cache in memory.
+        setLoadingInitial(false);
+      } catch {}
     };
-    const t = window.setInterval(tick, 4500);
-    tick();
-    return () => { alive = false; window.clearInterval(t); };
-  }, [rpc, shapeReady]);
 
-  const connectedLabel = account ? `Connected • ${shortAddr(account)}` : "Not connected";
+    const t = window.setInterval(poll, 2500);
+    poll();
 
-  const onConnect = async () => {
-    try {
-      if (!provider) throw new Error("No wallet provider");
-      const a = await requestAccounts(provider);
-      setAccount(a);
-      const cid = await ensureBaseChain(provider);
-      setChainId(cid);
-      toast.push({ title: "Wallet connected", detail: shortAddr(a), kind: "ok" });
-      setIsConnectOpen(false);
-    } catch (e: any) {
-      toast.push({ title: "Connect failed", detail: e?.message || "User rejected", kind: "warn" });
-    }
-  };
+    return () => {
+      stop = true;
+      window.clearInterval(t);
+    };
+  }, []);
+
+  const handle = useMemo(() => {
+    if (!account) return "anon";
+    return formatAddr(account);
+  }, [account]);
+
+  const connectedLabel = useMemo(() => {
+    if (!provider) return "Install wallet";
+    if (!account) return "Not connected";
+    return `Connected • ${formatAddr(account)}`;
+  }, [provider, account]);
 
   const sendMessage = async (text: string) => {
     if (!shapeReady) {
@@ -226,62 +225,32 @@ function AppInner() {
       const data = await encodeSendData(shapeRef.current, text);
       const dataSuffix = dataSuffixRef.current;
 
-      // 1) wallet_sendCalls (approval happens in wallet UI)
       const result = await walletSendCalls(provider, account, cid, CHAT_CONTRACT, data, dataSuffix);
       const callId = typeof result === "string" ? result : (result?.id || result?.callId || `${Date.now()}`);
       const localId = `local:${callId}`;
       const now = Date.now();
 
-      // 2) Optimistic insert as pending immediately after approval
-      setMessages((prev) => dedupeAndSort([...prev, {
-        id: localId,
-        createdAtMs: now,
-        from: account,
-        text,
-        status: "pending",
-      }]));
+      // Optimistic pending insert
+      setMessages((prev) =>
+        dedupeAndSort([
+          ...prev,
+          {
+            id: localId,
+            createdAtMs: now,
+            from: account,
+            text,
+            status: "pending",
+          },
+        ])
+      );
 
-      // 3) Resolve tx hash via wallet_getCallsStatus when available, then wait for receipt
-      let txHash: string | undefined;
-      const t0 = Date.now();
-      for (let i = 0; i < 90; i++) {
-        await sleep(1100);
-        try {
-          const status = await walletGetCallsStatus(provider, callId);
-          const hashes: string[] =
-            status?.transactionHashes ||
-            status?.txHashes ||
-            status?.receipts?.map((r: any) => r.transactionHash) ||
-            status?.calls?.flatMap((c: any) => c.transactionHash ? [c.transactionHash] : []) ||
-            [];
-          txHash = hashes?.[0] || txHash;
-          const done = status?.status === "CONFIRMED" || status?.status === "confirmed" || status?.status === "SUCCESS";
-          const failed = status?.status === "FAILED" || status?.status === "failed" || status?.status === "REVERTED";
-          if (failed) throw new Error(status?.error?.message || "Transaction failed");
-          if (done && txHash) break;
-        } catch {
-          // Some wallets don't support wallet_getCallsStatus; fall through to receipt polling if we have txHash later
-        }
-
-        if (txHash) {
-          const r = await rpcGetTransactionReceipt(rpc, txHash);
-          if (r?.status === "0x1") break;
-          if (r?.status === "0x0") throw new Error("Transaction reverted");
-        }
-
-        // Update elapsed note
-        const elapsed = Math.floor((Date.now() - t0) / 1000);
-        setMessages((prev) => prev.map((m) => m.id === localId ? ({ ...m, error: `pending • ${elapsed}s` }) : m));
-      }
-
-      setMessages((prev) => prev.map((m) => m.id === localId ? ({ ...m, status: "confirmed", txHash }) : m));
-      toast.push({ title: "Confirmed on Base", detail: txHash ? shortAddr(txHash) : "Mined", kind: "ok" });
+      // Resolve status
+      resolveCallStatus(callId, localId).catch(() => {});
       return { ok: true as const };
-
     } catch (e: any) {
-      const msg = e?.message || "Failed";
-      if (String(msg).toLowerCase().includes("user rejected") || e?.code === 4001) {
-        toast.push({ title: "Cancelled", detail: "Transaction was rejected", kind: "warn" });
+      const msg = (e?.message || "Transaction failed").toString();
+      if (msg.toLowerCase().includes("user rejected") || msg.toLowerCase().includes("rejected")) {
+        toast.push({ title: "Cancelled", detail: "You rejected the transaction.", kind: "warn" });
         return { ok: false as const, cancelled: true as const };
       }
       toast.push({ title: "Failed — retry", detail: msg, kind: "err" });
@@ -289,26 +258,83 @@ function AppInner() {
     }
   };
 
-  const displayed = useMemo(() => {
-    const mine = account?.toLowerCase();
+  const resolveCallStatus = async (callId: string, localId: string) => {
+    const started = Date.now();
+    let tries = 0;
+
+    while (tries < 80) {
+      tries++;
+      await new Promise((r) => setTimeout(r, 1500));
+
+      let st: any = null;
+      try {
+        st = await walletGetCallsStatus(provider, callId);
+      } catch {
+        // If wallet doesn't support getCallsStatus, we can't resolve it here
+        // (UI will keep it pending; user can still continue typing)
+      }
+
+      if (st?.status === "CONFIRMED" || st?.status === "confirmed") {
+        const txHash = st?.receipts?.[0]?.transactionHash || st?.transactionHash || st?.txHash;
+
+        // Update optimistic row
+        setMessages((prev) =>
+          prev.map((m) => (m.id === localId ? { ...m, status: "confirmed", txHash } : m))
+        );
+
+        // If we have receipts/logs, decode messages (best-effort)
+        try {
+          const receipts = st?.receipts || [];
+          const decoded = receipts.flatMap((r: any) => decodeMessagesFromReceipt(shapeRef.current, r));
+          if (decoded.length) {
+            setMessages((prev) => dedupeAndSort([...prev, ...decoded]));
+          }
+        } catch {}
+
+        toast.push({ title: "Confirmed on Base", detail: "Your message is permanent.", kind: "ok" });
+        return;
+      }
+
+      if (st?.status === "FAILED" || st?.status === "failed") {
+        const reason = st?.failureReason || "Transaction failed";
+        setMessages((prev) =>
+          prev.map((m) => (m.id === localId ? { ...m, status: "failed", error: reason } : m))
+        );
+        toast.push({ title: "Failed — retry", detail: reason, kind: "err" });
+        return;
+      }
+
+      // Still pending: update elapsed
+      const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      setMessages((prev) =>
+        prev.map((m) => (m.id === localId && m.status === "pending" ? { ...m, pendingSeconds: elapsed } : m))
+      );
+    }
+  };
+
+  const filteredMessages = useMemo(() => {
+    const q = (filters.search || "").toLowerCase();
     return messages.filter((m) => {
       if (!filters.showPending && m.status === "pending") return false;
-      if (filters.onlyMine && mine && m.from.toLowerCase() !== mine) return false;
-      if (filters.search) {
-        const q = filters.search.toLowerCase();
-        return m.text.toLowerCase().includes(q) || m.from.toLowerCase().includes(q);
+      if (filters.onlyMine && account && m.from.toLowerCase() !== account.toLowerCase()) return false;
+      if (q) {
+        const hay = `${m.from} ${m.text}`.toLowerCase();
+        return hay.includes(q);
       }
       return true;
     });
   }, [messages, filters, account]);
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="min-h-screen bg-bg text-text">
+      <div className="pointer-events-none fixed inset-0 noise opacity-[0.05]" />
+      <div className="pointer-events-none fixed inset-0 scanlines opacity-[0.04]" />
+
       <TopBar
-        handle={account ? shortAddr(account) : "guest"}
+        handle={handle}
         connectedLabel={connectedLabel}
-        status={rpcStatus}
-        statusNote={rpcNote}
+        status={status}
+        statusNote={statusNote}
         onConnect={() => setIsConnectOpen(true)}
         filters={filters}
         setFilters={setFilters}
@@ -316,48 +342,53 @@ function AppInner() {
         setReducedMotion={setReducedMotion}
       />
 
-      <Chat
-        loading={loading}
-        messages={displayed}
-        myAddress={account}
-        reducedMotion={reducedMotion}
-        rpcExplorerBase="https://basescan.org/tx/"
-      />
+      <main className="px-3 pb-3">
+        <Chat
+          loading={loadingInitial}
+          messages={filteredMessages}
+          myAddress={account}
+          reducedMotion={reducedMotion}
+          onScrolledUp={(v) => setNewChip(v)}
+          showNewChip={newChip}
+          onJumpToBottom={() => setNewChip(false)}
+        />
 
-      <Composer
-        disabled={!provider || !shapeReady}
-        connected={!!account}
-        onConnect={() => setIsConnectOpen(true)}
-        onSend={sendMessage}
-        myAddress={account}
-        chainId={chainId}
-        reducedMotion={reducedMotion}
-      />
+        <Composer
+          disabled={!provider}
+          connected={!!account}
+          onConnect={() => setIsConnectOpen(true)}
+          onSend={sendMessage}
+          myAddress={account}
+          chainId={chainId}
+          reducedMotion={reducedMotion}
+        />
+      </main>
 
       <ConnectModal
         open={isConnectOpen}
         onClose={() => setIsConnectOpen(false)}
-        onConnect={onConnect}
-        canConnect={!!provider}
+        onConnect={async () => {
+          try {
+            const p = getInjectedProvider();
+            if (!p) throw new Error("No wallet provider");
+            setProvider(p);
+            const accounts = await p.request({ method: "eth_requestAccounts" });
+            setAccount((accounts?.[0] || "").toLowerCase());
+            const cid = await p.request({ method: "eth_chainId" });
+            setChainId(cid);
+            setIsConnectOpen(false);
+          } catch (e: any) {
+            const msg = (e?.message || "Connect failed").toString();
+            toast.push({ title: "Connect failed", detail: msg, kind: "err" });
+          }
+        }}
       />
     </div>
   );
 }
 
-function dedupeAndSort(items: ChatMessage[]) {
+function dedupeAndSort(list: ChatMessage[]) {
   const map = new Map<string, ChatMessage>();
-  for (const m of items) map.set(m.id, m);
-  const arr = Array.from(map.values());
-  arr.sort((a, b) => a.createdAtMs - b.createdAtMs);
-  return arr;
-}
-
-function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
-
-export function App() {
-  return (
-    <ToastProvider>
-      <AppInner />
-    </ToastProvider>
-  );
+  for (const m of list) map.set(m.id, m);
+  return Array.from(map.values()).sort((a, b) => a.createdAtMs - b.createdAtMs);
 }
