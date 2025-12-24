@@ -14,7 +14,7 @@
 // Response shape matches Etherscan-style: { status, message, result }
 // where result is a stringified JSON ABI (so the client can JSON.parse it).
 
-const ADDRESS = "0xD4f66cBFA345C18Afc928a48f470566729bEEcA5";
+const ADDRESS = "0x2954ccf853ceb8fd330c1d2219bc557c5eabe3ec";
 const BLOCKSCOUT_ORIGIN = "https://base.blockscout.com";
 const BASE_RPC = "https://mainnet.base.org";
 const SIGDB_LOOKUP = "https://api.4byte.sourcify.dev/signature-database/v1/lookup";
